@@ -90,7 +90,14 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
     hour_key = datetime.now(timezone.utc).strftime("%H:%M")
 
     # Reference: logs -> date -> auto-id
-    log_ref = db.reference("logs").child(date_key).child(hour_key).push({
+    log_ref = (
+        db.reference("logs")
+        .child(date_key)
+        .child(hour_key)
+        .child(datetime.now(timezone.utc).strftime("S:%S"))
+    )
+
+    log_ref.set({
         "gate": gate_key,
         "ip": user_ip,
         "user": user_name,
