@@ -7,7 +7,7 @@ import uuid
 
 # Firebase credentials
 cred = credentials.Certificate(
-    r"C:\Users\y61\PycharmProjects\s\serviceKey.json"
+    r"serviceKey.json"
 )
 
 firebase_admin.initialize_app(cred, {
@@ -98,4 +98,4 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True, ssl_context=('cert.pem', 'key.pem'))
+    app.run(host="0.0.0.0", port=8080, debug=True, ssl=True)
