@@ -1,3 +1,5 @@
+import datetime
+
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, db
@@ -85,8 +87,14 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
     })
 
     # Log the action once
-    log_ref = db.reference("logs")
-    log_ref.push({
+    now = datetime.datetime.now(datetime.UTC)
+    date_key = f"{now.day:02d}_{now.month:02d}_{now.year}"
+    hour_minute = f"{now.hour:02d}:{now.minute:02d}"
+    second = f"{now.second:02d}"
+
+    # Path: /logs/DD_MM_YY/HH:mm/ss/commandId
+    log_ref = db.reference(f"/logs/{date_key}/{hour_minute}")
+    log_ref.child(second).set({
         "gate": gate_key,
         "ip": user_ip,
         "user": user_name,
