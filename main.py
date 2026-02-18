@@ -72,6 +72,61 @@ def control_gate():
     ), 200
 
 
+@app.route("/lists/log", methods=["POST"])
+def log_list_addition():
+    """
+    Log a list addition event without affecting the actual list data.
+    Expected JSON payload:
+    {
+        "listType": "whitelist" or "blacklist",
+        "userName": "who performed the action",
+        "commandId": (optional) unique id,
+        "item": {
+            "name": "item name",
+            "reason": "reason",
+            "expiresAt": timestamp or -1
+        }
+    }
+    """
+    data = request.get_json(force=True)
+
+    list_type = data.get("listType")
+    if list_type not in ["whitelist", "blacklist"]:
+        return jsonify(status="rejected", reason="Invalid listType"), 400
+
+    item = data.get("item", {})
+    if not item.get("name") or not item.get("reason"):
+        return jsonify(status="rejected", reason="Missing name or reason"), 400
+
+    user_name = data.get("userName", "unknown")
+    user_ip = request.remote_addr or "unknown"
+    command_id = data.get("commandId") or str(uuid.uuid4())
+
+    now = datetime.now(timezone.utc)
+    date_key = f"{now.day:02d}_{now.month:02d}_{now.year}"
+    hour_minute = f"{now.hour:02d}:{now.minute:02d}"
+    second = f"{now.second:02d}"
+
+    log_entry = {
+        "listType": list_type,
+        "item": {
+            "name": item.get("name"),
+            "reason": item.get("reason"),
+            "expiresAt": item.get("expiresAt", -1)
+        },
+        "user": user_name,
+        "ip": user_ip,
+        "timestamp": int(time.time()),
+        "commandId": command_id
+    }
+
+    # Store under /list_logs/DD_MM_YY/HH:mm/ss/commandId
+    log_ref = db.reference(f"/list_logs/{date_key}/{hour_minute}")
+    log_ref.child(f"S:{second}").set(log_entry)
+
+    return jsonify(status="acknowledged", commandId=command_id), 200
+
+
 def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, previous_state):
     ref = db.reference(f"/gates/{gate_key}")
 
