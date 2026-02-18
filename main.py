@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 import firebase_admin
 from firebase_admin import credentials, db
+from datetime import datetime, timezone
 import time
 import threading
 import uuid
@@ -84,9 +85,19 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
         "actionStatus": "Ready"
     })
 
-    # Log the action once
-    log_ref = db.reference("logs")
-    log_ref.push({
+    # Date bucket (UTC, stable, sortable)
+    date_key = datetime.now(timezone.utc).strftime("%d_%m_%Y")
+    hour_key = datetime.now(timezone.utc).strftime("%H:%M")
+
+    # Reference: logs -> date -> auto-id
+    log_ref = (
+        db.reference("logs")
+        .child(date_key)
+        .child(hour_key)
+        .child(datetime.now(timezone.utc).strftime("S:%S"))
+    )
+
+    log_ref.set({
         "gate": gate_key,
         "ip": user_ip,
         "user": user_name,
@@ -95,7 +106,5 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
         "commandId": command_id,
         "action": target_state
     })
-
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=True, ssl_context=('cert.pem', 'key.pem'))
