@@ -5,19 +5,94 @@ from datetime import datetime, timezone
 import time
 import threading
 import uuid
+import json
+import os
+import sys
 
-# Firebase credentials
-cred = credentials.Certificate(
-    r"C:\Users\y61\PycharmProjects\s\serviceKey.json"
-)
+# ── Load settings ──────────────────────────────────────────────────────────────
+SETTINGS_PATH = os.path.join(os.path.expanduser("~"), "Desktop", "ServerSettings", "settings.json")
+with open(SETTINGS_PATH) as f:
+    settings = json.load(f)
 
+# ── Firebase credentials ────────────────────────────────────────────────────────
+cred = credentials.Certificate(settings["firebase"]["serviceKeyPath"])
 firebase_admin.initialize_app(cred, {
-    "databaseURL": "https://mainproj-5e50a-default-rtdb.europe-west1.firebasedatabase.app/"
+    "databaseURL": settings["firebase"]["databaseURL"]
 })
 
 app = Flask(__name__)
 
 
+# ── Remote server control ───────────────────────────────────────────────────────
+@app.route("/server/control", methods=["POST"])
+def server_control():
+    """
+    Remote control endpoint for Android app.
+    Expected JSON payload:
+    {
+        "action": "disable" | "enable" | "status",
+        "shutdownKey": "<your secret key from settings.json>"
+    }
+    """
+    rc = settings.get("remoteControl", {})
+
+    # Check if remote control is allowed
+    if not rc.get("allowRemoteDisable", False):
+        return jsonify(status="rejected", reason="Remote control is disabled"), 403
+
+    # IP whitelist check (if list is non-empty)
+    allowed_ips = rc.get("allowedRemoteIPs", [])
+    caller_ip = request.remote_addr
+    if allowed_ips and caller_ip not in allowed_ips:
+        return jsonify(status="rejected", reason="IP not allowed", ip=caller_ip), 403
+
+    data = request.get_json(force=True)
+    action = data.get("action", "").lower()
+    provided_key = data.get("shutdownKey", "")
+    expected_key = settings["server"].get("shutdownKey", "")
+
+    # Validate secret key
+    if provided_key != expected_key:
+        return jsonify(status="rejected", reason="Invalid shutdown key"), 401
+
+    if action == "status":
+        return jsonify(
+            status="ok",
+            serverEnabled=settings["server"].get("enabled", True),
+            host=settings["server"].get("host"),
+            port=settings["server"].get("port"),
+            uptime=int(time.time())
+        ), 200
+
+    elif action == "disable":
+        if not settings["server"].get("enabled", True):
+            return jsonify(status="ok", message="Server already disabled"), 200
+
+        # Update settings file
+        settings["server"]["enabled"] = False
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(settings, f, indent=2)
+
+        # Shutdown Flask in a background thread (gives time to send response)
+        def shutdown():
+            time.sleep(1)
+            os.kill(os.getpid(), 9)
+
+        threading.Thread(target=shutdown, daemon=True).start()
+        return jsonify(status="ok", message="Server shutting down"), 200
+
+    elif action == "enable":
+        # Mark enabled in settings (server must be restarted manually after this)
+        settings["server"]["enabled"] = True
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(settings, f, indent=2)
+        return jsonify(status="ok", message="Enabled flag set. Restart the server to apply."), 200
+
+    else:
+        return jsonify(status="rejected", reason=f"Unknown action: {action}"), 400
+
+
+# ── Gate control ────────────────────────────────────────────────────────────────
 @app.route("/gate/control", methods=["POST"])
 def control_gate():
     data = request.get_json(force=True)
@@ -31,27 +106,15 @@ def control_gate():
     gate_key = gate_number.lower().replace(" ", "")
     ref = db.reference(f"/gates/{gate_key}")
 
-    # Get current state BEFORE updating
     current = ref.get() or {}
     previous_state = current.get("state", "closed")
 
-    # ---- BUSY CHECK ----
     if current.get("actionStatus") in ["Opening...", "Closing..."]:
-        return jsonify(
-            status="rejected",
-            reason="gate busy",
-            commandId=command_id
-        ), 409
+        return jsonify(status="rejected", reason="gate busy", commandId=command_id), 409
 
-    # ---- IDEMPOTENCY ----
     if current.get("lastCommandId") == command_id:
-        return jsonify(
-            status="acknowledged",
-            duplicate=True,
-            commandId=command_id
-        ), 200
+        return jsonify(status="acknowledged", duplicate=True, commandId=command_id), 200
 
-    # ---- ACK + MARK BUSY ----
     ref.update({
         "lastCommandId": command_id,
         "actionStatus": "Opening..." if target_state == "open" else "Closing...",
@@ -59,35 +122,18 @@ def control_gate():
         "lastAckAt": int(time.time())
     })
 
-    # Start background sequence
     threading.Thread(
         target=run_gate_sequence,
         args=(gate_key, target_state, user_ip, user_name, command_id, previous_state),
         daemon=True
     ).start()
 
-    return jsonify(
-        status="acknowledged",
-        commandId=command_id
-    ), 200
+    return jsonify(status="acknowledged", commandId=command_id), 200
 
 
+# ── List logging ────────────────────────────────────────────────────────────────
 @app.route("/lists/log", methods=["POST"])
 def log_list_addition():
-    """
-    Log a list addition event without affecting the actual list data.
-    Expected JSON payload:
-    {
-        "listType": "whitelist" or "blacklist",
-        "userName": "who performed the action",
-        "commandId": (optional) unique id,
-        "item": {
-            "name": "item name",
-            "reason": "reason",
-            "expiresAt": timestamp or -1
-        }
-    }
-    """
     data = request.get_json(force=True)
 
     list_type = data.get("listType")
@@ -120,31 +166,25 @@ def log_list_addition():
         "commandId": command_id
     }
 
-    # Store under /list_logs/DD_MM_YY/HH:mm/ss/commandId
     log_ref = db.reference(f"/list_logs/{date_key}/{hour_minute}")
     log_ref.child(f"S:{second}").set(log_entry)
 
     return jsonify(status="acknowledged", commandId=command_id), 200
 
 
+# ── Gate sequence ───────────────────────────────────────────────────────────────
 def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, previous_state):
     ref = db.reference(f"/gates/{gate_key}")
+    delay = settings["gates"].get("movementDelaySeconds", 2)
 
-    # Set intermediate state
     ref.update({"actionStatus": "Opening..." if target_state == "open" else "Closing..."})
-    time.sleep(2)  # simulate gate movement
+    time.sleep(delay)
 
-    # Update final state
-    ref.update({
-        "state": target_state,
-        "actionStatus": "Ready"
-    })
+    ref.update({"state": target_state, "actionStatus": "Ready"})
 
-    # Date bucket (UTC, stable, sortable)
     date_key = datetime.now(timezone.utc).strftime("%d_%m_%Y")
     hour_key = datetime.now(timezone.utc).strftime("%H:%M")
 
-    # Reference: logs -> date -> auto-id
     log_ref = (
         db.reference("logs")
         .child(date_key)
@@ -161,5 +201,17 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
         "commandId": command_id,
         "action": target_state
     })
+
+
+# ── Entry point ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True, ssl_context=('cert.pem', 'key.pem'))
+    srv = settings["server"]
+    if not srv.get("enabled", True):
+        print("Server is disabled in settings.json. Set enabled=true to start.")
+        sys.exit(0)
+
+    app.run(
+        host=srv.get("host", "0.0.0.0"),
+        port=srv.get("port", 8080),
+        debug=srv.get("debug", False)
+    )
