@@ -26,7 +26,7 @@ firebase_admin.initialize_app(cred, {
 
 app = Flask(__name__)
 
-UPLOAD_FOLDER = "C:/Users/user/Desktop/images"
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "media")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 
@@ -65,7 +65,7 @@ def server_control():
     caller_ip = request.remote_addr or ""
 
     # 1. Superadmin check
-    if email:
+    if email and action!="status":
         safe_email = email.replace(".", "_")
         role_level = db.reference(f"/users/{safe_email}/roleLevel").get()
         if role_level is None or role_level < 2:
@@ -160,7 +160,9 @@ def server_control():
 def control_gate():
     data = request.get_json(force=True)
 
-    gate_number = data["gate"]
+    gate_number = data.get("gate")
+    if not gate_number:
+        return jsonify(status="rejected", reason="Missing gate field"), 400
     target_state = data["state"].lower()
     command_id = data.get("commandId") or str(uuid.uuid4())
     user_name = data.get("userName", "unknown")
@@ -266,15 +268,18 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
     })
 
 
-# ── Image upload ────────────────────────────────────────────────────────────
+# ── Image upload ────────────────────────────────────────────────────────────────
 @app.route("/chat/upload-image", methods=["POST"])
 def upload_image():
     if not request.content_type or "image" not in request.content_type:
         return jsonify({"error": "invalid content type"}), 400
 
     data = request.data
+    if not data:
+        return jsonify({"error": "empty body"}), 400
 
-    if len(data) > 10 * 1024 * 1024:
+    # 5MB hard limit — compressImage on the app side keeps it well under this
+    if len(data) > 5 * 1024 * 1024:
         return jsonify({"error": "file too large"}), 413
 
     filename = f"{uuid.uuid4().hex}.jpg"
@@ -283,9 +288,21 @@ def upload_image():
     with open(path, "wb") as f:
         f.write(data)
 
-    return jsonify({
-        "imageUrl": request.host_url + "media/" + filename
-    })
+    # Build the URL the app can actually reach.
+    # If host is 0.0.0.0 (listen on all interfaces), use the incoming
+    # request's host so we return the real LAN IP the device connected to.
+    host = settings["server"].get("host", "0.0.0.0")
+    port = settings["server"].get("port", 8080)
+
+    if host == "0.0.0.0":
+        # request.host_url already contains the correct IP:port the client used
+        image_url = request.host_url.rstrip("/") + "/media/" + filename
+    else:
+        image_url = f"http://{host}:{port}/media/{filename}"
+
+    print(f"[upload] saved {filename} ({len(data)} bytes) -> {image_url}")
+
+    return jsonify({"imageUrl": image_url})
 
 
 @app.route("/media/<filename>")

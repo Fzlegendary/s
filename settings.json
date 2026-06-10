@@ -4,7 +4,7 @@
     "databaseURL": "https://mainproj-5e50a-default-rtdb.europe-west1.firebasedatabase.app"
   },
   "server": {
-    "enabled": false,
+    "enabled": true,
     "host": "0.0.0.0",
     "port": 8080,
     "debug": true,
