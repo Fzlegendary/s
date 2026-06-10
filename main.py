@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import firebase_admin
 from firebase_admin import credentials, db
 from datetime import datetime, timezone
@@ -10,70 +10,132 @@ import os
 import sys
 
 # ── Load settings ──────────────────────────────────────────────────────────────
-SETTINGS_PATH = os.path.join(os.path.expanduser("~"), "Desktop", "ServerSettings", "settings.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 with open(SETTINGS_PATH) as f:
     settings = json.load(f)
 
 # ── Firebase credentials ────────────────────────────────────────────────────────
-cred = credentials.Certificate(settings["firebase"]["serviceKeyPath"])
+service_key_path = settings["firebase"]["serviceKeyPath"]
+if not os.path.isabs(service_key_path):
+    service_key_path = os.path.join(BASE_DIR, service_key_path)
+cred = credentials.Certificate(service_key_path)
 firebase_admin.initialize_app(cred, {
     "databaseURL": settings["firebase"]["databaseURL"]
 })
 
 app = Flask(__name__)
 
+UPLOAD_FOLDER = "C:/Users/user/Desktop/images"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+# ── Server event logger ─────────────────────────────────────────────────────────
+def log_server_event(action, user_name, email, user_uid, ip, result, reason=None):
+    now = datetime.now(timezone.utc)
+    date_key = now.strftime("%d_%m_%Y")
+    hour_minute = now.strftime("%H:%M")
+    second = now.strftime("%S")
+
+    log_entry = {
+        "action": action,
+        "userName": user_name or "unknown",
+        "email": email or "",
+        "userUID": user_uid or "",
+        "ip": ip or "",
+        "result": result,
+        "timestamp": int(time.time())
+    }
+    if reason:
+        log_entry["reason"] = reason
+
+    ref = db.reference(f"/server_logs/{date_key}/{hour_minute}")
+    ref.child(f"S:{second}").set(log_entry)
+
 
 # ── Remote server control ───────────────────────────────────────────────────────
 @app.route("/server/control", methods=["POST"])
 def server_control():
-    """
-    Remote control endpoint for Android app.
-    Expected JSON payload:
-    {
-        "action": "disable" | "enable" | "status",
-        "shutdownKey": "<your secret key from settings.json>"
-    }
-    """
-    rc = settings.get("remoteControl", {})
-
-    # Check if remote control is allowed
-    if not rc.get("allowRemoteDisable", False):
-        return jsonify(status="rejected", reason="Remote control is disabled"), 403
-
-    # IP whitelist check (if list is non-empty)
-    allowed_ips = rc.get("allowedRemoteIPs", [])
-    caller_ip = request.remote_addr
-    if allowed_ips and caller_ip not in allowed_ips:
-        return jsonify(status="rejected", reason="IP not allowed", ip=caller_ip), 403
-
     data = request.get_json(force=True)
     action = data.get("action", "").lower()
     provided_key = data.get("shutdownKey", "")
-    expected_key = settings["server"].get("shutdownKey", "")
+    user_name = data.get("userName", "")
+    email = data.get("email", "")
+    user_uid = data.get("userUID", "")
+    caller_ip = request.remote_addr or ""
 
-    # Validate secret key
-    if provided_key != expected_key:
-        return jsonify(status="rejected", reason="Invalid shutdown key"), 401
+    # 1. Superadmin check
+    if email:
+        safe_email = email.replace(".", "_")
+        role_level = db.reference(f"/users/{safe_email}/roleLevel").get()
+        if role_level is None or role_level < 2:
+            log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "Superadmin access required")
+            return jsonify(status="rejected", reason="Superadmin access required"), 403
 
+    # 2. Admin blacklist check
+    blacklist = (db.reference("/server_admin_blacklist").get()) or {}
+    blacklisted = bool(
+        (user_uid and blacklist.get("users", {}).get(user_uid)) or
+        (user_name and blacklist.get("usernames", {}).get(user_name)) or
+        (email and blacklist.get("emails", {}).get(email))
+    )
+    if blacklisted:
+        if email:
+            db.reference(f"/users/{email.replace('.', '_')}/roleLevel").set(0)
+        log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "Admin is blacklisted — demoted to user")
+        return jsonify(status="rejected", reason="Admin is blacklisted — demoted to user"), 403
+
+    # 3. Admin whitelist check (only if whitelist has entries)
+    whitelist = (db.reference("/server_whitelist").get()) or {}
+    has_entries = any(whitelist.get(k, {}) for k in ["ips", "users", "usernames", "emails"])
+    if has_entries:
+        in_wl = bool(
+            (caller_ip and whitelist.get("ips", {}).get(caller_ip)) or
+            (user_uid and whitelist.get("users", {}).get(user_uid)) or
+            (user_name and whitelist.get("usernames", {}).get(user_name)) or
+            (email and whitelist.get("emails", {}).get(email))
+        )
+        if not in_wl:
+            log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "Not in admin whitelist")
+            return jsonify(status="rejected", reason="Not in admin whitelist"), 403
+
+    # 4. Existing settings.json remote control checks
+    rc = settings.get("remoteControl", {})
+    if not rc.get("allowRemoteControl", False):
+        log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "Remote control is disabled")
+        return jsonify(status="rejected", reason="Remote control is disabled"), 403
+
+    allowed_ips = rc.get("allowedRemoteIPs", [])
+    if allowed_ips and caller_ip not in allowed_ips:
+        log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "IP not allowed")
+        return jsonify(status="rejected", reason="IP not allowed", ip=caller_ip), 403
+
+    # 5. Handle actions
     if action == "status":
         return jsonify(
             status="ok",
-            serverEnabled=settings["server"].get("enabled", True),
+            enabled=settings["server"].get("enabled", True),
             host=settings["server"].get("host"),
             port=settings["server"].get("port"),
             uptime=int(time.time())
         ), 200
 
-    elif action == "disable":
+    if action == "disable":
+        expected_key = settings["server"].get("shutdownKey", "")
+        if provided_key != expected_key and expected_key:
+            log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "Invalid shutdown key")
+            return jsonify(status="rejected", reason="Invalid shutdown key"), 401
+
         if not settings["server"].get("enabled", True):
+            log_server_event(action, user_name, email, user_uid, caller_ip, "success")
             return jsonify(status="ok", message="Server already disabled"), 200
 
-        # Update settings file
         settings["server"]["enabled"] = False
         with open(SETTINGS_PATH, "w") as f:
             json.dump(settings, f, indent=2)
 
-        # Shutdown Flask in a background thread (gives time to send response)
+        log_server_event(action, user_name, email, user_uid, caller_ip, "success")
+
         def shutdown():
             time.sleep(1)
             os.kill(os.getpid(), 9)
@@ -82,10 +144,11 @@ def server_control():
         return jsonify(status="ok", message="Server shutting down"), 200
 
     elif action == "enable":
-        # Mark enabled in settings (server must be restarted manually after this)
         settings["server"]["enabled"] = True
         with open(SETTINGS_PATH, "w") as f:
             json.dump(settings, f, indent=2)
+
+        log_server_event(action, user_name, email, user_uid, caller_ip, "success")
         return jsonify(status="ok", message="Enabled flag set. Restart the server to apply."), 200
 
     else:
@@ -201,6 +264,33 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
         "commandId": command_id,
         "action": target_state
     })
+
+
+# ── Image upload ────────────────────────────────────────────────────────────
+@app.route("/chat/upload-image", methods=["POST"])
+def upload_image():
+    if not request.content_type or "image" not in request.content_type:
+        return jsonify({"error": "invalid content type"}), 400
+
+    data = request.data
+
+    if len(data) > 10 * 1024 * 1024:
+        return jsonify({"error": "file too large"}), 413
+
+    filename = f"{uuid.uuid4().hex}.jpg"
+    path = os.path.join(UPLOAD_FOLDER, filename)
+
+    with open(path, "wb") as f:
+        f.write(data)
+
+    return jsonify({
+        "imageUrl": request.host_url + "media/" + filename
+    })
+
+
+@app.route("/media/<filename>")
+def media(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename)
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────────
