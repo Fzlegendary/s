@@ -305,6 +305,7 @@ def upload_image():
     return jsonify({"imageUrl": image_url})
 
 
+
 @app.route("/media/<filename>")
 def media(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
