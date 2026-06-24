@@ -1,28 +1,168 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 import firebase_admin
 from firebase_admin import credentials, db
 from datetime import datetime, timezone
 import time
 import threading
 import uuid
+import json
+import os
+import sys
 
-# Firebase credentials
-cred = credentials.Certificate(
-    r"serviceKey.json"
-)
+# ── Load settings ──────────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
+with open(SETTINGS_PATH) as f:
+    settings = json.load(f)
 
+# ── Firebase credentials ────────────────────────────────────────────────────────
+service_key_path = settings["firebase"]["serviceKeyPath"]
+if not os.path.isabs(service_key_path):
+    service_key_path = os.path.join(BASE_DIR, service_key_path)
+cred = credentials.Certificate(service_key_path)
 firebase_admin.initialize_app(cred, {
-    "databaseURL": "https://mainproj-5e50a-default-rtdb.europe-west1.firebasedatabase.app/"
+    "databaseURL": settings["firebase"]["databaseURL"]
 })
 
 app = Flask(__name__)
 
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "media")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+
+# ── Server event logger ─────────────────────────────────────────────────────────
+def log_server_event(action, user_name, email, user_uid, ip, result, reason=None):
+    now = datetime.now(timezone.utc)
+    date_key = now.strftime("%d_%m_%Y")
+    hour_minute = now.strftime("%H:%M")
+    second = now.strftime("%S")
+
+    log_entry = {
+        "action": action,
+        "userName": user_name or "unknown",
+        "email": email or "",
+        "userUID": user_uid or "",
+        "ip": ip or "",
+        "result": result,
+        "timestamp": int(time.time())
+    }
+    if reason:
+        log_entry["reason"] = reason
+
+    ref = db.reference(f"/server_logs/{date_key}/{hour_minute}")
+    ref.child(f"S:{second}").set(log_entry)
+
+
+# ── Remote server control ───────────────────────────────────────────────────────
+@app.route("/server/control", methods=["POST"])
+def server_control():
+    data = request.get_json(force=True)
+    action = data.get("action", "").lower()
+    provided_key = data.get("shutdownKey", "")
+    user_name = data.get("userName", "")
+    email = data.get("email", "")
+    user_uid = data.get("userUID", "")
+    caller_ip = request.remote_addr or ""
+
+    # 1. Superadmin check
+    if email and action!="status":
+        safe_email = email.replace(".", "_")
+        role_level = db.reference(f"/users/{safe_email}/roleLevel").get()
+        if role_level is None or role_level < 2:
+            log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "Superadmin access required")
+            return jsonify(status="rejected", reason="Superadmin access required"), 403
+
+    # 2. Admin blacklist check
+    blacklist = (db.reference("/server_admin_blacklist").get()) or {}
+    blacklisted = bool(
+        (user_uid and blacklist.get("users", {}).get(user_uid)) or
+        (user_name and blacklist.get("usernames", {}).get(user_name)) or
+        (email and blacklist.get("emails", {}).get(email))
+    )
+    if blacklisted:
+        if email:
+            db.reference(f"/users/{email.replace('.', '_')}/roleLevel").set(0)
+        log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "Admin is blacklisted — demoted to user")
+        return jsonify(status="rejected", reason="Admin is blacklisted — demoted to user"), 403
+
+    # 3. Admin whitelist check (only if whitelist has entries)
+    whitelist = (db.reference("/server_whitelist").get()) or {}
+    has_entries = any(whitelist.get(k, {}) for k in ["ips", "users", "usernames", "emails"])
+    if has_entries:
+        in_wl = bool(
+            (caller_ip and whitelist.get("ips", {}).get(caller_ip)) or
+            (user_uid and whitelist.get("users", {}).get(user_uid)) or
+            (user_name and whitelist.get("usernames", {}).get(user_name)) or
+            (email and whitelist.get("emails", {}).get(email))
+        )
+        if not in_wl:
+            log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "Not in admin whitelist")
+            return jsonify(status="rejected", reason="Not in admin whitelist"), 403
+
+    # 4. Existing settings.json remote control checks
+    rc = settings.get("remoteControl", {})
+    if not rc.get("allowRemoteControl", False):
+        log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "Remote control is disabled")
+        return jsonify(status="rejected", reason="Remote control is disabled"), 403
+
+    allowed_ips = rc.get("allowedRemoteIPs", [])
+    if allowed_ips and caller_ip not in allowed_ips:
+        log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "IP not allowed")
+        return jsonify(status="rejected", reason="IP not allowed", ip=caller_ip), 403
+
+    # 5. Handle actions
+    if action == "status":
+        return jsonify(
+            status="ok",
+            enabled=settings["server"].get("enabled", True),
+            host=settings["server"].get("host"),
+            port=settings["server"].get("port"),
+            uptime=int(time.time())
+        ), 200
+
+    if action == "disable":
+        expected_key = settings["server"].get("shutdownKey", "")
+        if provided_key != expected_key and expected_key:
+            log_server_event(action, user_name, email, user_uid, caller_ip, "rejected", "Invalid shutdown key")
+            return jsonify(status="rejected", reason="Invalid shutdown key"), 401
+
+        if not settings["server"].get("enabled", True):
+            log_server_event(action, user_name, email, user_uid, caller_ip, "success")
+            return jsonify(status="ok", message="Server already disabled"), 200
+
+        settings["server"]["enabled"] = False
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(settings, f, indent=2)
+
+        log_server_event(action, user_name, email, user_uid, caller_ip, "success")
+
+        def shutdown():
+            time.sleep(1)
+            os.kill(os.getpid(), 9)
+
+        threading.Thread(target=shutdown, daemon=True).start()
+        return jsonify(status="ok", message="Server shutting down"), 200
+
+    elif action == "enable":
+        settings["server"]["enabled"] = True
+        with open(SETTINGS_PATH, "w") as f:
+            json.dump(settings, f, indent=2)
+
+        log_server_event(action, user_name, email, user_uid, caller_ip, "success")
+        return jsonify(status="ok", message="Enabled flag set. Restart the server to apply."), 200
+
+    else:
+        return jsonify(status="rejected", reason=f"Unknown action: {action}"), 400
+
+
+# ── Gate control ────────────────────────────────────────────────────────────────
 @app.route("/gate/control", methods=["POST"])
 def control_gate():
     data = request.get_json(force=True)
 
-    gate_number = data["gate"]
+    gate_number = data.get("gate")
+    if not gate_number:
+        return jsonify(status="rejected", reason="Missing gate field"), 400
     target_state = data["state"].lower()
     command_id = data.get("commandId") or str(uuid.uuid4())
     user_name = data.get("userName", "unknown")
@@ -31,27 +171,15 @@ def control_gate():
     gate_key = gate_number.lower().replace(" ", "")
     ref = db.reference(f"/gates/{gate_key}")
 
-    # Get current state BEFORE updating
     current = ref.get() or {}
     previous_state = current.get("state", "closed")
 
-    # ---- BUSY CHECK ----
     if current.get("actionStatus") in ["Opening...", "Closing..."]:
-        return jsonify(
-            status="rejected",
-            reason="gate busy",
-            commandId=command_id
-        ), 409
+        return jsonify(status="rejected", reason="gate busy", commandId=command_id), 409
 
-    # ---- IDEMPOTENCY ----
     if current.get("lastCommandId") == command_id:
-        return jsonify(
-            status="acknowledged",
-            duplicate=True,
-            commandId=command_id
-        ), 200
+        return jsonify(status="acknowledged", duplicate=True, commandId=command_id), 200
 
-    # ---- ACK + MARK BUSY ----
     ref.update({
         "lastCommandId": command_id,
         "actionStatus": "Opening..." if target_state == "open" else "Closing...",
@@ -59,35 +187,18 @@ def control_gate():
         "lastAckAt": int(time.time())
     })
 
-    # Start background sequence
     threading.Thread(
         target=run_gate_sequence,
         args=(gate_key, target_state, user_ip, user_name, command_id, previous_state),
         daemon=True
     ).start()
 
-    return jsonify(
-        status="acknowledged",
-        commandId=command_id
-    ), 200
+    return jsonify(status="acknowledged", commandId=command_id), 200
 
 
+# ── List logging ────────────────────────────────────────────────────────────────
 @app.route("/lists/log", methods=["POST"])
 def log_list_addition():
-    """
-    Log a list addition event without affecting the actual list data.
-    Expected JSON payload:
-    {
-        "listType": "whitelist" or "blacklist",
-        "userName": "who performed the action",
-        "commandId": (optional) unique id,
-        "item": {
-            "name": "item name",
-            "reason": "reason",
-            "expiresAt": timestamp or -1
-        }
-    }
-    """
     data = request.get_json(force=True)
 
     list_type = data.get("listType")
@@ -120,31 +231,25 @@ def log_list_addition():
         "commandId": command_id
     }
 
-    # Store under /list_logs/DD_MM_YY/HH:mm/ss/commandId
     log_ref = db.reference(f"/list_logs/{date_key}/{hour_minute}")
     log_ref.child(f"S:{second}").set(log_entry)
 
     return jsonify(status="acknowledged", commandId=command_id), 200
 
 
+# ── Gate sequence ───────────────────────────────────────────────────────────────
 def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, previous_state):
     ref = db.reference(f"/gates/{gate_key}")
+    delay = settings["gates"].get("movementDelaySeconds", 2)
 
-    # Set intermediate state
     ref.update({"actionStatus": "Opening..." if target_state == "open" else "Closing..."})
-    time.sleep(2)  # simulate gate movement
+    time.sleep(delay)
 
-    # Update final state
-    ref.update({
-        "state": target_state,
-        "actionStatus": "Ready"
-    })
+    ref.update({"state": target_state, "actionStatus": "Ready"})
 
-    # Date bucket (UTC, stable, sortable)
     date_key = datetime.now(timezone.utc).strftime("%d_%m_%Y")
     hour_key = datetime.now(timezone.utc).strftime("%H:%M")
 
-    # Reference: logs -> date -> auto-id
     log_ref = (
         db.reference("logs")
         .child(date_key)
@@ -161,9 +266,60 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
         "commandId": command_id,
         "action": target_state
     })
+
+
+# ── Image upload ────────────────────────────────────────────────────────────────
+@app.route("/chat/upload-image", methods=["POST"])
+def upload_image():
+    if not request.content_type or "image" not in request.content_type:
+        return jsonify({"error": "invalid content type"}), 400
+
+    data = request.data
+    if not data:
+        return jsonify({"error": "empty body"}), 400
+
+    # 5MB hard limit — compressImage on the app side keeps it well under this
+    if len(data) > 5 * 1024 * 1024:
+        return jsonify({"error": "file too large"}), 413
+
+    filename = f"{uuid.uuid4().hex}.jpg"
+    path = os.path.join(UPLOAD_FOLDER, filename)
+
+    with open(path, "wb") as f:
+        f.write(data)
+
+    # Build the URL the app can actually reach.
+    # If host is 0.0.0.0 (listen on all interfaces), use the incoming
+    # request's host so we return the real LAN IP the device connected to.
+    host = settings["server"].get("host", "0.0.0.0")
+    port = settings["server"].get("port", 8080)
+
+    if host == "0.0.0.0":
+        # request.host_url already contains the correct IP:port the client used
+        image_url = request.host_url.rstrip("/") + "/media/" + filename
+    else:
+        image_url = f"http://{host}:{port}/media/{filename}"
+
+    print(f"[upload] saved {filename} ({len(data)} bytes) -> {image_url}")
+
+    return jsonify({"imageUrl": image_url})
+
+
+
+@app.route("/media/<filename>")
+def media(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename)
+
+
+# ── Entry point ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    srv = settings["server"]
+    if not srv.get("enabled", True):
+        print("Server is disabled in settings.json. Set enabled=true to start.")
+        sys.exit(0)
+
     app.run(
-        host="0.0.0.0",
-        port=8080,
-        debug=True
+        host=srv.get("host", "0.0.0.0"),
+        port=srv.get("port", 8080),
+        debug=srv.get("debug", False)
     )
