@@ -242,10 +242,17 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
     ref = db.reference(f"/gates/{gate_key}")
     delay = settings["gates"].get("movementDelaySeconds", 2)
 
+    # Print to terminal
+    gate_name = gate_key.replace("gate", "Gate ")
+    print(f"{gate_name} {'opening' if target_state == 'open' else 'closing'}")
+
     ref.update({"actionStatus": "Opening..." if target_state == "open" else "Closing..."})
     time.sleep(delay)
 
     ref.update({"state": target_state, "actionStatus": "Ready"})
+
+    # print to terminal at end of action
+    print(f"{gate_name} {'opened' if target_state == 'open' else 'closed'}")
 
     date_key = datetime.now(timezone.utc).strftime("%d_%m_%Y")
     hour_key = datetime.now(timezone.utc).strftime("%H:%M")
@@ -266,7 +273,6 @@ def run_gate_sequence(gate_key, target_state, user_ip, user_name, command_id, pr
         "commandId": command_id,
         "action": target_state
     })
-
 
 # ── Image upload ────────────────────────────────────────────────────────────────
 @app.route("/chat/upload-image", methods=["POST"])
